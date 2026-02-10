@@ -17,17 +17,43 @@ package net
 import (
 	"context"
 	"net"
+	"time"
 )
+
+var customDNSAddress string
 
 func SetDefaultDNSAddress(dnsAddress string) {
 	if _, _, err := net.SplitHostPort(dnsAddress); err != nil {
 		dnsAddress = net.JoinHostPort(dnsAddress, "53")
 	}
-	// Change default dns server
+	customDNSAddress = dnsAddress
+	createNewResolver()
+}
+
+// ClearDNSCache clears the DNS cache by creating a fresh resolver instance.
+// This should be called before reconnection attempts to ensure fresh DNS lookups.
+func ClearDNSCache() {
+	createNewResolver()
+}
+
+func createNewResolver() {
+	dnsAddr := customDNSAddress
+	if dnsAddr == "" {
+		// Use system default
+		net.DefaultResolver = &net.Resolver{
+			PreferGo: true,
+		}
+		return
+	}
+	
+	// Use custom DNS address
 	net.DefaultResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return net.Dial(network, dnsAddress)
+			var d net.Dialer
+			dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			return d.DialContext(dialCtx, network, dnsAddr)
 		},
 	}
 }

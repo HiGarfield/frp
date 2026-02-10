@@ -332,6 +332,8 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 	xl := xlog.FromContextSafe(svr.ctx)
 
 	loginFunc := func() (bool, error) {
+		netpkg.ClearDNSCache()
+
 		xl.Infof("try to connect to server...")
 		conn, connector, err := svr.login()
 		if err != nil {
