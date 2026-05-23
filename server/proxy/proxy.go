@@ -44,7 +44,26 @@ func RegisterProxyFactory(proxyConfType reflect.Type, factory func(*BaseProxy) P
 	proxyFactoryRegistry[proxyConfType] = factory
 }
 
-type GetWorkConnFn func() (net.Conn, error)
+type WorkConn struct {
+	conn *msg.Conn
+}
+
+func NewWorkConn(conn *msg.Conn) *WorkConn {
+	return &WorkConn{conn: conn}
+}
+
+func (c *WorkConn) Start(m *msg.StartWorkConn) (net.Conn, error) {
+	if err := c.conn.WriteMsg(m); err != nil {
+		return nil, err
+	}
+	return c.conn, nil
+}
+
+func (c *WorkConn) Close() error {
+	return c.conn.Close()
+}
+
+type GetWorkConnFn func() (*WorkConn, error)
 
 type Proxy interface {
 	Context() context.Context
@@ -125,13 +144,13 @@ func (pxy *BaseProxy) GetWorkConnFromPool(src, dst net.Addr) (workConn net.Conn,
 	xl := xlog.FromContextSafe(pxy.ctx)
 	// try all connections from the pool
 	for i := 0; i < pxy.poolCount+1; i++ {
-		if workConn, err = pxy.getWorkConnFn(); err != nil {
+		var pxyWorkConn *WorkConn
+		if pxyWorkConn, err = pxy.getWorkConnFn(); err != nil {
 			xl.Warnf("failed to get work connection: %v", err)
 			return
 		}
-		xl.Debugf("get a new work connection: [%s]", workConn.RemoteAddr().String())
+		xl.Debugf("get a new work connection: [%s]", pxyWorkConn.conn.RemoteAddr().String())
 		xl.Spawn().AppendPrefix(pxy.GetName())
-		workConn = netpkg.NewContextConn(pxy.ctx, workConn)
 
 		var (
 			srcAddr    string
@@ -150,7 +169,7 @@ func (pxy *BaseProxy) GetWorkConnFromPool(src, dst net.Addr) (workConn net.Conn,
 			dstAddr, dstPortStr, _ = net.SplitHostPort(dst.String())
 			dstPort, _ = strconv.ParseUint(dstPortStr, 10, 16)
 		}
-		err := msg.WriteMsg(workConn, &msg.StartWorkConn{
+		workConn, err = pxyWorkConn.Start(&msg.StartWorkConn{
 			ProxyName: pxy.GetName(),
 			SrcAddr:   srcAddr,
 			SrcPort:   uint16(srcPort),
@@ -160,8 +179,10 @@ func (pxy *BaseProxy) GetWorkConnFromPool(src, dst net.Addr) (workConn net.Conn,
 		})
 		if err != nil {
 			xl.Warnf("failed to send message to work connection from pool: %v, times: %d", err, i)
-			workConn.Close()
+			pxyWorkConn.Close()
+			workConn = nil
 		} else {
+			workConn = netpkg.NewContextConn(pxy.ctx, workConn)
 			break
 		}
 	}
@@ -171,6 +192,36 @@ func (pxy *BaseProxy) GetWorkConnFromPool(src, dst net.Addr) (workConn net.Conn,
 		return
 	}
 	return
+}
+
+// startVisitorListener sets up a VisitorManager listener for visitor-based proxies (STCP, SUDP).
+func (pxy *BaseProxy) startVisitorListener(secretKey string, allowUsers []string, proxyType string) error {
+	// if allowUsers is empty, only allow same user from proxy
+	if len(allowUsers) == 0 {
+		allowUsers = []string{pxy.GetUserInfo().User}
+	}
+	listener, err := pxy.rc.VisitorManager.Listen(pxy.GetName(), secretKey, allowUsers)
+	if err != nil {
+		return err
+	}
+	pxy.listeners = append(pxy.listeners, listener)
+	pxy.xl.Infof("%s proxy custom listen success", proxyType)
+	pxy.startCommonTCPListenersHandler()
+	return nil
+}
+
+// buildDomains constructs a list of domains from custom domains and subdomain configuration.
+func (pxy *BaseProxy) buildDomains(customDomains []string, subDomain string) []string {
+	domains := make([]string, 0, len(customDomains)+1)
+	for _, d := range customDomains {
+		if d != "" {
+			domains = append(domains, d)
+		}
+	}
+	if subDomain != "" {
+		domains = append(domains, subDomain+"."+pxy.serverCfg.SubDomainHost)
+	}
+	return domains
 }
 
 // startCommonTCPListenersHandler start a goroutine handler for each listener.
